@@ -2307,10 +2307,10 @@ int reactor::run() {
     bool idle = false;
 
     std::function<bool()> check_for_work = [this] () {
-        return poll_once() || !_pending_tasks.empty() || seastar::thread::try_run_one_yielded_thread();
+        return poll_once() || !_pending_tasks.empty() || seastar::preemptible::try_run_one_yielded_item();
     };
     std::function<bool()> pure_check_for_work = [this] () {
-        return pure_poll_once() || !_pending_tasks.empty() || seastar::thread::try_run_one_yielded_thread();
+        return pure_poll_once() || !_pending_tasks.empty() || seastar::preemptible::try_run_one_yielded_item();
     };
     while (true) {
         run_tasks(_pending_tasks);

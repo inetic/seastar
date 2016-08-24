@@ -1012,6 +1012,7 @@ reactor::make_pollfn(Func&& func) {
 }
 
 extern __thread reactor* local_engine;
+// TODO: Never used
 extern __thread size_t task_quota;
 
 inline reactor& engine() {

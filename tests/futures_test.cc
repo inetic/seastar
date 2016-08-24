@@ -403,6 +403,190 @@ SEASTAR_TEST_CASE(test_do_while_failing_in_the_second_step) {
     });
 }
 
+/// \brief Helper function to run the asynchronous \c action \c N times.
+template<typename AsyncAction>
+future<> repeat_n(const unsigned int N, AsyncAction&& action) {
+    return do_with((unsigned int)0, [N, action = std::forward<AsyncAction>(action)](unsigned int& i) mutable {
+        return repeat([&i, N, action = std::forward<AsyncAction>(action)]() mutable {
+            if (i++ == N) {
+                return make_ready_future<stop_iteration>(stop_iteration::yes);
+            }
+            return futurize<future<>>::apply(action)
+                .then([]() { return stop_iteration::no; });
+        });
+    });
+};
+
+SEASTAR_TEST_CASE(test_go_dormant) {
+    using namespace std::chrono_literals;
+    using clock = timer<>::clock;
+
+    unsigned int N = 5; // Arbitrary value > 0
+    auto start = clock::now();
+
+    return repeat_n(N, [start] () {
+        return go_dormant(1s);
+    }).then_wrapped([start] (future<> f) {
+        BOOST_REQUIRE(!f.failed());
+
+        // When there is no other work in the reactor, dormant
+        // tasks shall be executed right a way.
+        BOOST_REQUIRE((clock::now() - start) < 1ms);
+    });
+}
+
+SEASTAR_TEST_CASE(test_go_dormant_into_past) {
+    using namespace std::chrono_literals;
+    using clock = timer<>::clock;
+
+    constexpr unsigned int N = 5; // Arbitrary value > 0
+    auto start = clock::now();
+
+    return repeat_n(N, [start] () {
+        return go_dormant(-1s);
+    }).then_wrapped([start] (future<> f) {
+        BOOST_REQUIRE(!f.failed());
+
+        // When there is no other work in the reactor, dormant
+        // tasks shall be executed right a way.
+        BOOST_REQUIRE((clock::now() - start) < 1ms);
+    });
+}
+
+SEASTAR_TEST_CASE(test_go_dormant_busy) {
+    using namespace std::chrono_literals;
+    using clock = timer<>::clock;
+
+    int repeat_count = 5;
+    auto dormant_duration = 20ms;
+    auto start = clock::now();
+
+    return do_with(false, [=] (auto& stop_flag) {
+        auto dormant_action = repeat_n(repeat_count, [=]() {
+            return go_dormant(dormant_duration);
+        })
+        .then([&stop_flag] { stop_flag = true; });
+
+        // Add one busy action to make sure our dormant_action won't get
+        // awaken due to cpu going idle.
+        auto busy_action = repeat([&stop_flag]() {
+            return later().then([&stop_flag] {
+                return stop_flag ? stop_iteration::yes
+                                 : stop_iteration::no;
+            });
+        });
+
+        return when_all(std::move(dormant_action), std::move(busy_action))
+            .then_wrapped([=](auto f) {
+                BOOST_REQUIRE(!f.failed());
+
+                auto exp_duration = repeat_count * dormant_duration;
+                auto duration = clock::now() - start;
+
+                // std::abs(duration) not yet in g++-5.4.0?
+                auto diff = duration >= exp_duration ? duration - exp_duration
+                                                     : exp_duration - duration;
+
+                BOOST_REQUIRE(diff < 1ms);
+
+                return make_ready_future<>();
+            });
+    });
+}
+
+SEASTAR_TEST_CASE(test_do_while_preemptive_and_no_scheduling) {
+    namespace stdx = std::experimental;
+
+    constexpr unsigned int N = 5;
+
+    struct state {
+        stdx::optional<int> prev_index;
+        int counters[2] = {0};
+    };
+
+    auto r = [](int index, state& s) {
+        return preemptible_repeat(nullptr, [index, &s] () {
+            // Test that the continuations alternate.
+            if (s.prev_index) {
+                BOOST_REQUIRE_EQUAL(*s.prev_index, !index);
+            }
+
+            s.prev_index = index;
+
+            return ++s.counters[index] == N ? stop_iteration::yes
+                                            : stop_iteration::no;
+        });
+    };
+
+    return do_with(state(), [r] (auto& state) {
+        return when_all(r(0, state), r(1, state)).then([&] (auto results) {
+            BOOST_REQUIRE(!std::get<0>(results).failed());
+            BOOST_REQUIRE(!std::get<1>(results).failed());
+
+            BOOST_REQUIRE_EQUAL(state.counters[0], N);
+            BOOST_REQUIRE_EQUAL(state.counters[1], N);
+
+            return make_ready_future<>();
+        });
+    });
+}
+
+#include "core/thread_scheduling_group.hh"
+
+SEASTAR_TEST_CASE(test_do_while_preemptive_with_scheduling) {
+    using namespace std::chrono_literals;
+    using clock = timer<>::clock;
+
+    struct state {
+        float usage[3] = {0.5, 0.3, 0.2};
+        seastar::thread_scheduling_group scheduling_groups[3] = {{1ms, usage[0]},
+                                                                 {1ms, usage[1]},
+                                                                 {1ms, usage[2]}};
+        int64_t counters[3] = {0};
+    };
+
+    clock::time_point end_time = clock::now() + 100ms;
+
+    auto r = [end_time](unsigned int i, state& s) {
+        return preemptible_repeat(&s.scheduling_groups[i], [&s, i, end_time] () {
+            ++s.counters[i];
+            return clock::now() >= end_time ? stop_iteration::yes
+                                            : stop_iteration::no;
+        });
+    };
+
+    return do_with(state(), [r, end_time] (auto& state) {
+        // Add one busy loop to make sure the preemptible repeats won't get
+        // awaken due to cpu going idle.
+        future<> b = repeat([end_time] () {
+                         return later().then([end_time]() {
+                             return clock::now() >= end_time
+                                                 ? stop_iteration::yes
+                                                 : stop_iteration::no;
+                         });
+                     });
+
+        return when_all(r(0, state),
+                        r(1, state),
+                        r(2, state),
+                        std::move(b)).then([&] (auto results) {
+            BOOST_REQUIRE(!std::get<0>(results).failed());
+            BOOST_REQUIRE(!std::get<1>(results).failed());
+            BOOST_REQUIRE(!std::get<2>(results).failed());
+
+            auto total = state.counters[0] + state.counters[1] + state.counters[2];
+            auto one_percent = total * 0.01;
+
+            for (int i = 0; i < 3; ++i) {
+                int64_t expected = state.usage[i] * total;
+                BOOST_REQUIRE(std::abs(state.counters[i] - expected) < one_percent);
+            }
+
+            return make_ready_future<>();
+        });
+    });
+}
+
 SEASTAR_TEST_CASE(test_parallel_for_each_early_failure) {
     return do_with(0, [] (int& counter) {
         return parallel_for_each(boost::irange(0, 11000), [&counter] (int i) {

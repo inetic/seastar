@@ -29,12 +29,17 @@
 #include "future.hh"
 #include "shared_ptr.hh"
 #include "do_with.hh"
+#include "timer.hh"
+#include "preemptible.hh"
+#include "thread_scheduling_group.hh"
+#include "util/defer.hh"
 #include <tuple>
 #include <iterator>
 #include <vector>
 #include <experimental/optional>
 
 /// \cond internal
+// TODO: Never used
 extern __thread size_t task_quota;
 /// \endcond
 
@@ -172,6 +177,40 @@ void do_until_continued(StopCondition&& stop_cond, AsyncAction&& action, promise
 }
 /// \endcond
 
+static inline
+future<> now() {
+    return make_ready_future<>();
+}
+
+// Returns a future which is not ready but is scheduled to resolve soon.
+future<> later();
+
+/// Future that gets resolved at a specified time or when there are no other tasks to run.
+///
+/// \param when a timepoint when the callback shall be executed.
+static inline
+future<> go_dormant(typename timer<>::time_point when) {
+    if (when <= timer<>::clock::now()) {
+        // Or should this be `now()`?
+        return later();
+    }
+
+    // Can't use do_with because preemptible isn't movable.
+    auto obj = std::make_unique<seastar::preemptible>();
+    auto fut = obj->go_dormant(when);
+    return fut.then_wrapped([obj = std::move(obj)] (auto&& fut) {
+        return std::move(fut);
+    });
+}
+
+/// Future that gets resolved at a specified time or when there are no other tasks to run.
+///
+/// \param duration duration from now when the callback shall be executed.
+static inline
+future<> go_dormant(typename timer<>::duration duration) {
+    return go_dormant(timer<>::clock::now() + duration);
+}
+
 enum class stop_iteration { no, yes };
 
 /// Invokes given action until it fails or the function requests iteration to stop by returning
@@ -212,6 +251,70 @@ future<> repeat(AsyncAction&& action) {
         auto f = p.get_future();
         schedule(make_task([action = std::forward<AsyncAction>(action), p = std::move(p)]() mutable {
             repeat(std::forward<AsyncAction>(action)).forward_to(std::move(p));
+        }));
+        return f;
+    } catch (...) {
+        return make_exception_future(std::current_exception());
+    }
+}
+
+/// Invokes given action until it fails or the function requests iteration to stop by returning
+/// \c stop_iteration::yes.
+///
+/// \param scheduling_group a pointer to an instance of \c thread_scheduling_group for limiting
+///                         cpu usage. If it is nullptr then each action invocation shall be
+//                          pushed at the back of the reactor's task queue.
+/// \param action a callable taking no arguments, returning a future<stop_iteration>.  Will
+///               be called again as soon as the future resolves, unless the
+///               future fails, action throws, or it resolves with \c stop_iteration::yes.
+///               If \c action is an r-value it can be moved in the middle of iteration.
+/// \return a ready future if we stopped successfully, or a failed future if
+///         a call to to \c action failed.
+template<typename AsyncAction>
+static inline
+future<> preemptible_repeat(seastar::thread_scheduling_group* scheduling_group, AsyncAction&& action) {
+    using futurator = futurize<std::result_of_t<AsyncAction()>>;
+    static_assert(std::is_same<future<stop_iteration>, typename futurator::type>::value, "bad AsyncAction signature");
+
+    if (scheduling_group) scheduling_group->account_start();
+    auto account_stop = defer([sg = scheduling_group]() { if (sg) sg->account_stop(); });
+
+    try {
+        do {
+            auto f = futurator::apply(action);
+
+            if (!f.available()) {
+                return f.then([scheduling_group, action = std::forward<AsyncAction>(action)] (stop_iteration stop) mutable {
+                    if (stop == stop_iteration::yes) {
+                        return make_ready_future<>();
+                    } else {
+                        return preemptible_repeat(scheduling_group, std::forward<AsyncAction>(action));
+                    }
+                });
+            }
+
+            if (f.get0() == stop_iteration::yes) {
+                return make_ready_future<>();
+            }
+
+            if (!scheduling_group) {
+                break;
+            }
+
+            if (auto opt_when = scheduling_group->next_scheduling_point()) {
+                return go_dormant(*opt_when).then([scheduling_group, action = std::forward<AsyncAction>(action)]() mutable {
+                    return preemptible_repeat(scheduling_group, std::forward<AsyncAction>(action));
+                });
+            }
+        } while (!need_preempt());
+
+        promise<> p;
+        auto f = p.get_future();
+        schedule(make_task([scheduling_group,
+                            action = std::forward<AsyncAction>(action),
+                            p = std::move(p)]() mutable {
+            preemptible_repeat(scheduling_group, std::forward<AsyncAction>(action))
+                .forward_to(std::move(p));
         }));
         return f;
     } catch (...) {
@@ -688,14 +791,6 @@ public:
         return std::move(_result);
     }
 };
-
-static inline
-future<> now() {
-    return make_ready_future<>();
-}
-
-// Returns a future which is not ready but is scheduled to resolve soon.
-future<> later();
 
 /// @}
 

@@ -273,6 +273,7 @@ core = [
     'core/scollectd.cc',
     'core/app-template.cc',
     'core/thread.cc',
+    'core/preemptible.cc',
     'core/dpdk_rte.cc',
     'util/conversions.cc',
     'util/log.cc',
