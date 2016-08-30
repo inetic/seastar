@@ -32,7 +32,8 @@ struct preemptible final {
     std::experimental::optional<promise<>> _sched_promise;
 
 public:
-    future<> go_dormant(timer<>::time_point);
+    template<typename TimeOrDuration>
+    future<> go_dormant(TimeOrDuration);
 
     preemptible() = default;
     preemptible(const preemptible&) = delete;
@@ -59,8 +60,9 @@ private:
     static bool try_run_one_yielded_item();
 };
 
+template<typename TimeOrDuration>
 inline
-future<> preemptible::go_dormant(timer<>::time_point when) {
+future<> preemptible::go_dormant(TimeOrDuration when) {
     _preempted_items.push_back(*this);
     _sched_promise.emplace();
     _sched_timer.arm(when);

@@ -177,24 +177,11 @@ void do_until_continued(StopCondition&& stop_cond, AsyncAction&& action, promise
 }
 /// \endcond
 
+/// \cond internal
+
+template<typename TimeOrDuration>
 static inline
-future<> now() {
-    return make_ready_future<>();
-}
-
-// Returns a future which is not ready but is scheduled to resolve soon.
-future<> later();
-
-/// Future that gets resolved at a specified time or when there are no other tasks to run.
-///
-/// \param when a timepoint when the callback shall be executed.
-static inline
-future<> go_dormant(typename timer<>::time_point when) {
-    if (when <= timer<>::clock::now()) {
-        // Or should this be `now()`?
-        return later();
-    }
-
+future<> go_dormant_impl(TimeOrDuration when) {
     // Can't use do_with because preemptible isn't movable.
     auto obj = std::make_unique<seastar::preemptible>();
     auto fut = obj->go_dormant(when);
@@ -203,12 +190,24 @@ future<> go_dormant(typename timer<>::time_point when) {
     });
 }
 
+/// \endcond
+
+/// Future that gets resolved at a specified time or when there are no other tasks to run.
+///
+/// \param when a timepoint when the callback shall be executed.
+static inline
+future<> go_dormant(timer<>::time_point when) {
+    if (when <= timer<>::clock::now()) return make_ready_future<>();
+    return go_dormant_impl(when);
+}
+
 /// Future that gets resolved at a specified time or when there are no other tasks to run.
 ///
 /// \param duration duration from now when the callback shall be executed.
 static inline
-future<> go_dormant(typename timer<>::duration duration) {
-    return go_dormant(timer<>::clock::now() + duration);
+future<> go_dormant(timer<>::duration duration) {
+    if (duration <= std::chrono::nanoseconds(0)) return make_ready_future<>();
+    return go_dormant_impl(duration);
 }
 
 enum class stop_iteration { no, yes };
@@ -791,6 +790,14 @@ public:
         return std::move(_result);
     }
 };
+
+static inline
+future<> now() {
+    return make_ready_future<>();
+}
+
+// Returns a future which is not ready but is scheduled to resolve soon.
+future<> later();
 
 /// @}
 
